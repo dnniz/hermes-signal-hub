@@ -55,6 +55,8 @@ since the previous run. That is what turns a static ranking into a feed.
 - **Learns** from `decide owner/repo yes|no|noise`, nudging the ranking weights
   within a bounded range.
 - **Exposes** all of it over CLI, HTTP and SSE.
+- **Fans out** to as many flows as you want: each keeps its own cursor, so one
+  flow reading first never starves another.
 
 ## Using it
 
@@ -74,6 +76,11 @@ $HUB --db $DB --json rank --limit 20    # JSON array
 $HUB --db $DB decide owner/repo yes
 $HUB --db $DB decide owner/repo no
 $HUB --db $DB weights
+
+# another flow consumes the same bus, with its own cursor
+$HUB --db $DB --json consume morning-ai --limit 20     # read, no side effects
+$HUB --db $DB consume morning-ai --limit 20 --advance  # confirm, after processing
+$HUB --db $DB cursors                                  # who is behind
 ```
 
 `--db` is a global flag: it goes **before** the subcommand.
@@ -85,7 +92,8 @@ $HUB --db $DB serve --port 8787
 ```
 
 `GET /health` · `/repos` · `/jsonl` · `/digest` · `/briefing` · `/search` ·
-`/events` · `/stream` (SSE; add `once=1` for a finite stream) · `POST /collect`.
+`/events` · `/consume` · `/cursors` · `/stream` (SSE; add `once=1` for a finite
+stream) · `POST /collect`.
 
 ### As a daily job
 
@@ -135,4 +143,4 @@ ruff check src/ tests/
 ruff format --check src/ tests/
 ```
 
-155 tests, no network access required.
+177 tests, no network access required.

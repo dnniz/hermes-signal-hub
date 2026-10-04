@@ -114,6 +114,39 @@ class SignalHubHandler(BaseHTTPRequestHandler):
                         )
                     },
                 )
+            elif path == "/cursors":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "head_event_id": self.hub.store.max_event_id(),
+                        "consumers": self.hub.store.list_consumers(),
+                    },
+                )
+            elif path == "/consume":
+                # Per-consumer fan-out. The cursor only moves when advance=1, so
+                # a consumer that dies after reading replays instead of losing.
+                name = q.get("consumer", "")
+                if not name:
+                    self._send(HTTPStatus.BAD_REQUEST, {"error": "consumer is required"})
+                    return
+                events = self.hub.store.read_events_for(
+                    name,
+                    kind=q.get("kind"),
+                    run_id=int(q["run"]) if q.get("run") else None,
+                    limit=min(int(q.get("limit", 50)), 500),
+                )
+                ids = [e["id"] for e in events]
+                if q.get("advance") == "1" and ids:
+                    self.hub.store.advance_cursor(name, ids)
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "consumer": name,
+                        "cursor": self.hub.store.cursor_position(name),
+                        "pending": len(ids),
+                        "events": events,
+                    },
+                )
             elif path == "/feedback":
                 self._send(
                     HTTPStatus.OK,

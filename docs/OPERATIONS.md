@@ -64,6 +64,8 @@ Pinned by `tests/test_collector.py::test_search_call_budget_is_respected` and
 | `digest` | Telegram-ready markdown |
 | `search` | full-text over what was already found |
 | `events` | read the event bus (`--latest-run`, `--run`, `--unconsumed`, `--consume`) |
+| `consume` | read events for a named consumer and advance **its** cursor |
+| `cursors` | show every consumer and how far behind it is |
 | `ack` | mark repos as shown to a human |
 | `decide` | record a verdict and retune the weights |
 | `weights` | inspect or `--reset` the learned weights |
@@ -74,8 +76,11 @@ Pinned by `tests/test_collector.py::test_search_call_budget_is_respected` and
 
 HTTP routes exposed by `serve`, for the same surface in scriptable form:
 `/health`, `/healthz`, `/repos`, `/jsonl`, `/digest`, `/briefing`, `/search`,
-`/events`, `/runs`, `/stats`, `/weights`, `/stream`, plus `POST /collect`,
-`/feedback` and `/consume`, and `POST /ack`.
+`/events`, `/consume`, `/cursors`, `/runs`, `/stats`, `/weights`, `/stream`,
+plus `POST /collect`, `/feedback` and `POST /ack`.
+
+`/consume?consumer=NAME[&advance=1]` is the fan-out endpoint: one cursor per
+consumer, so several flows read the same bus without stealing from each other.
 
 ## Configuration
 
@@ -189,6 +194,7 @@ From `signalhub --db DB --json status`:
 | `stats.repos` | total known repos; should grow slowly |
 | `stats.new_repos` | what the last run discovered; `0` on a repeat run is correct |
 | `stats.unconsumed_events` | machine backlog; if it grows unbounded, a consumer is not acking |
+| `cursors` output | per-flow lag; one growing while others keep up means that flow stalled |
 | `stats.observations` | should be ≈ `repos × runs`; flat means collection stopped |
 | `stats.last_run.api_calls` | quota per run; a jump means the query set grew |
 | `stats.last_run.errors` | any non-zero value means a query was rejected |

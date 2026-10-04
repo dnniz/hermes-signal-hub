@@ -530,82 +530,96 @@ Over HTTP the equivalents are `POST /consume` with
 
 ## 6. Routing to other flows
 
-### 6.1 The pattern
+Every flow that consumes the bus needs its **own cursor**. This is not an
+optimisation: it is the only thing that makes fan-out correct.
 
-Every consumer is a **named** reader of the bus:
+### 6.0 Why a cursor, and not `consumed_by`
 
-1. Pick a stable consumer name (`morning-ai`, `build-router`, …). It is the value
-   written to `consumed_by` and the name of your cursor file.
-2. Read with a **cursor**, not with `--unconsumed`, if you must not miss events
-   that another flow already claimed.
-3. Do the side effect (message, ticket, PR).
-4. Advance the cursor, then optionally `POST /consume`.
+The `events` table has a `consumed_by` column, and it is a trap for a
+multi-flow setup. It records *one* consumer per event, so whichever flow reads
+first claims the events and every other flow sees nothing:
 
-### 6.2 Avoiding double delivery
-
-Double delivery has two distinct causes with two distinct fixes:
-
-| Cause | Symptom | Fix |
-|---|---|---|
-| Two flows share one `--unconsumed` queue | Flow B never sees an event Flow A already read | Per-consumer cursor (`after_id`), not `--unconsumed` |
-| The same flow re-runs over the same window | The same repo appears in two digests | Consume/ack what you delivered, and pin reads to a `run_id` |
-
-`consumed_by` is a **single** column, so it can only express "handled by someone".
-It cannot express per-consumer delivery state. That is the structural reason the
-cursor pattern exists.
-
-### 6.3 Concrete example: a second flow subscribing
-
-Given a `research` flow that should pick up freshly discovered repos and open an
-investigation, without competing with the daily digest:
-
-```bash
-#!/usr/bin/env bash
-# /opt/data/repos/hermes-signal-hub/scripts/research_pickup.sh
-set -euo pipefail
-HUB=/opt/data/repos/hermes-signal-hub/scripts/signalhub
-DB=/opt/data/.signalhub/signal.db
-CURSOR_FILE=/opt/data/.signalhub/research.cursor
-CONSUMER=research
-mkdir -p "$(dirname "$CURSOR_FILE")"
-
-CURSOR=0
-[ -f "$CURSOR_FILE" ] && CURSOR="$(cat "$CURSOR_FILE")"
-
-# Read strictly what this flow has not seen, regardless of who else consumed.
-NEW="$("$HUB" --db "$DB" --json events --after "$CURSOR" --kind repo.discovered --limit 50)"
-
-IDS=$(printf '%s' "$NEW" | python3 -c 'import json,sys; print(" ".join(str(e["id"]) for e in json.load(sys.stdin)))')
-[ -z "$IDS" ] && exit 0
-
-REPOS=$(printf '%s' "$NEW" | python3 -c 'import json,sys; print(" ".join(dict.fromkeys(e["full_name"] for e in json.load(sys.stdin))))')
-
-# 1. side effect first
-# shellcheck disable=SC2086
-for repo in $REPOS; do
-  "$HUB" --db "$DB" rank --format briefing --limit 1 >/dev/null   # or: dispatch to your agent
-  echo "queued $repo" >> /opt/data/.signalhub/research.log
-done
-
-# 2. then advance the cursor
-printf '%s' "$NEW" | python3 -c 'import json,sys; e=json.load(sys.stdin); print(e[-1]["id"] if e else 0)' > "$CURSOR_FILE"
-
-# 3. and flag them for anyone polling --unconsumed
-# shellcheck disable=SC2086
-"$HUB" --db "$DB" events --after 0 --limit 0 --consume "$CONSUMER" >/dev/null 2>&1 || true
+```
+digest reads events 1-10, sets consumed_by='daily-digest'
+MorningAI reads events 1-10 → empty
 ```
 
-The daily digest (`scripts/daily_digest.sh`) uses the *other* strategy — it pins
-to `--latest-run`, which is idempotent because it reports what that one run
-found rather than the whole backlog. Copy whichever of the two matches your flow:
+That is silent and it looks like MorningAI is simply behind. `consumer_cursors`
+replaces it for real fan-out: one row per flow, each advancing independently.
 
-| Flow shape | Strategy | Command |
-|---|---|---|
-| "Tell me what is new since I last looked" | Cursor | `--json events --after $CURSOR` |
-| "Tell me what today's run found" | Run pin | `--json events --latest-run` |
-| "Give me whatever nobody has handled" | Shared queue | `--json events --unconsumed` (single consumer only) |
+`mark_consumed` is kept for single-consumer setups and for recording that *someone*
+handled an event, but a second flow must not build on it.
 
----
+### 6.1 The two-step contract
+
+Reading and confirming are separate on purpose. The cursor only moves when you
+say so, so a consumer that crashes between reading and processing replays the
+same events instead of silently dropping them.
+
+```bash
+# 1. read without side effects
+signalhub --db DB --json consume morning-ai --limit 20 > batch.json
+
+# 2. do the work
+
+# 3. only now, confirm
+signalhub --db DB consume morning-ai --limit 20 --advance
+```
+
+Over HTTP the same thing:
+
+```bash
+curl "localhost:8787/consume?consumer=morning-ai&limit=20&advance=1"
+```
+
+### 6.2 Replay after a failure
+
+```python
+from signalhub.store import Store
+
+store = Store("signal.db")
+store.rewind_cursor("morning-ai")          # back to the start
+store.rewind_cursor("morning-ai", 120)     # or to a specific event
+```
+
+Rewinding is the reason the cursor lives in a table rather than in each flow's
+own state file: the fix is one call, and it is visible to every tool that reads
+the store.
+
+### 6.3 Monotonic cursors
+
+`advance_cursor` only ever moves forward. A late ack from a straggler batch
+cannot rewind a cursor that has already moved past it, so out-of-order
+confirmation does not cause events to be replayed forever.
+
+### 6.4 Watching for a stalled flow
+
+```bash
+signalhub --db DB cursors
+```
+
+```
+morning-ai               cursor=     3  pendiente=   532
+daily-digest             cursor=   528  pendiente=     4
+```
+
+A growing `pendiente` for one consumer while another keeps up means that flow
+stopped consuming — the same signal as an unbounded `unconsumed_events` in a
+single-consumer setup, but attributable to a specific flow.
+
+Over HTTP: `GET /cursors`.
+
+### 6.5 Wiring MorningAI
+
+The contract is three commands, and MorningAI needs no change to the collector:
+
+1. `consume morning-ai --json --limit 20` at the start of its run
+2. process what comes back
+3. `consume morning-ai --advance` when done
+
+Use a name that identifies the flow, not the job. `"morning-ai"` is right;
+`"cron"` is not, because the second flow to adopt it inherits the same cursor.
+
 
 ## 7. Error handling patterns
 

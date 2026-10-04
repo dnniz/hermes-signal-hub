@@ -28,12 +28,26 @@ from typing import Any
 
 from .github import RepoSnapshot, utcnow
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+
+-- One row per consumer flow, holding the last event id that flow has handled.
+--
+-- This replaces the single ``events.consumed_by`` column, which could not express
+-- fan-out: whichever consumer read first claimed the events and every other
+-- flow saw nothing. A cursor per consumer means every flow sees every event and
+-- advances independently.
+CREATE TABLE IF NOT EXISTS consumer_cursors (
+    consumer   TEXT PRIMARY KEY,
+    last_id    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_consumer_cursors_last ON consumer_cursors(last_id);
 
 CREATE TABLE IF NOT EXISTS repos (
     full_name        TEXT PRIMARY KEY,
@@ -647,6 +661,13 @@ class Store:
         return out
 
     def mark_consumed(self, event_ids: list[int], consumer: str) -> int:
+        """Legacy shared-column ack. Prefer :meth:`advance_cursor` for fan-out.
+
+        Kept because it is still the right tool for a single-consumer setup and
+        for marking an event as handled by *someone*, but it cannot serve several
+        independent flows: the second one to read gets nothing.
+        """
+
         if not event_ids:
             return 0
         with self.transaction() as conn:
@@ -655,6 +676,110 @@ class Store:
                 [(consumer, i) for i in event_ids],
             )
             return cur.rowcount
+
+    # ------------------------------------------------------ consumer cursors
+
+    def cursor_position(self, consumer: str) -> int:
+        """Last event id this consumer has handled. Unknown consumer is 0."""
+
+        row = self.conn.execute(
+            "SELECT last_id FROM consumer_cursors WHERE consumer = ?",
+            (consumer,),
+        ).fetchone()
+        return int(row["last_id"]) if row else 0
+
+    def read_events_for(
+        self,
+        consumer: str,
+        *,
+        kind: str | None = None,
+        run_id: int | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Events this consumer has not handled yet, oldest first.
+
+        Pure read: it never moves the cursor, so a consumer that crashes
+        mid-batch replays the same events on its next run instead of losing
+        them. Call :meth:`advance_cursor` only after the work is done.
+        """
+
+        if limit <= 0:
+            return []
+        params: list[Any] = [self.cursor_position(consumer)]
+        sql = "SELECT * FROM events WHERE id > ?"
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        if run_id is not None:
+            sql += " AND run_id = ?"
+            params.append(run_id)
+        sql += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d["payload"])
+            out.append(d)
+        return out
+
+    def advance_cursor(self, consumer: str, event_ids: list[int]) -> int:
+        """Mark these events handled by ``consumer`` and move the cursor forward.
+
+        Monotonic by design: a late ack from a straggler batch must not rewind
+        the cursor and cause events to be replayed.
+
+        Returns the number of events the cursor has now covered, not the number
+        of rows written, so callers can log what they actually finished.
+        """
+
+        if not event_ids:
+            return 0
+        target = max(event_ids)
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO consumer_cursors (consumer, last_id, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(consumer) DO UPDATE SET
+                    last_id = MAX(consumer_cursors.last_id, excluded.last_id),
+                    updated_at = datetime('now')
+                """,
+                (consumer, target),
+            )
+        return len(set(event_ids))
+
+    def rewind_cursor(self, consumer: str, event_id: int = 0) -> None:
+        """Reset a consumer to an earlier point, for replay after a failure."""
+
+        with self.transaction() as conn:
+            if event_id <= 0:
+                conn.execute("DELETE FROM consumer_cursors WHERE consumer = ?", (consumer,))
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO consumer_cursors (consumer, last_id, updated_at)
+                    VALUES (?, ?, datetime('now'))
+                    ON CONFLICT(consumer) DO UPDATE SET
+                        last_id = excluded.last_id, updated_at = datetime('now')
+                    """,
+                    (consumer, event_id),
+                )
+
+    def list_consumers(self) -> list[dict[str, Any]]:
+        """Consumers that have actually moved a cursor, with their lag."""
+
+        head = self.max_event_id()
+        rows = self.conn.execute(
+            """
+            SELECT c.consumer, c.last_id, c.updated_at,
+                   ? - c.last_id AS pending
+            FROM consumer_cursors c
+            ORDER BY c.last_id ASC
+            """,
+            (head,),
+        ).fetchall()
+        return [dict(r) for r in rows if int(r["last_id"]) > 0]
 
     def max_event_id(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()

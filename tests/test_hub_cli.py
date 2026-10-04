@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import pytest
 
 from conftest import make_repo
+from signalhub.cli import main
 from signalhub.github import RateLimitState, RepoSnapshot
 from signalhub.hub import SignalHub, resolve_token
 from signalhub.server import make_server
@@ -269,6 +270,43 @@ class TestHttpApi:
         assert status == 200
         assert json.loads(body)["status"] == "ok"
 
+    def test_two_consumers_over_http_see_the_same_events(self, server: str) -> None:
+        _, body_a, _ = self.get(server, "/consume?consumer=a&limit=5")
+        _, body_b, _ = self.get(server, "/consume?consumer=b&limit=5")
+        a, b = json.loads(body_a), json.loads(body_b)
+        assert [e["id"] for e in a["events"]] == [e["id"] for e in b["events"]]
+        assert a["pending"] > 0
+
+    def test_advancing_one_consumer_over_http_leaves_the_other(self, server: str) -> None:
+        _, before, _ = self.get(server, "/consume?consumer=a&limit=100")
+        total = json.loads(before)["pending"]
+        assert total > 2
+
+        self.get(server, "/consume?consumer=a&limit=2&advance=1")
+        _, body_a, _ = self.get(server, "/consume?consumer=a&limit=100")
+        # The batch was consumed; the rest of the backlog is untouched.
+        assert json.loads(body_a)["pending"] == total - 2
+
+        _, body_b, _ = self.get(server, "/consume?consumer=b&limit=100")
+        assert json.loads(body_b)["pending"] == total
+
+    def test_reading_without_advance_does_not_move_the_http_cursor(self, server: str) -> None:
+        _, first, _ = self.get(server, "/consume?consumer=a&limit=3")
+        _, second, _ = self.get(server, "/consume?consumer=a&limit=3")
+        assert json.loads(first)["pending"] == json.loads(second)["pending"] > 0
+
+    def test_consume_without_a_consumer_is_rejected(self, server: str) -> None:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            self.get(server, "/consume")
+        assert exc.value.code == 400
+
+    def test_cursors_endpoint_reports_advancement(self, server: str) -> None:
+        _, _, _ = self.get(server, "/cursors")
+        self.get(server, "/consume?consumer=a&limit=1&advance=1")
+        _, body, _ = self.get(server, "/cursors")
+        rows = {r["consumer"]: r for r in json.loads(body)["consumers"]}
+        assert rows["a"]["last_id"] > 0
+
     def test_repos_listing(self, server: str) -> None:
         status, body, _ = self.get(server, "/repos?limit=2")
         assert status == 200
@@ -459,3 +497,85 @@ class TestCli:
         text = build_parser().format_help()
         for verb in ("collect", "rank", "digest", "events", "decide", "serve", "check"):
             assert verb in text
+
+    def test_help_lists_the_fanout_subcommands(self, capsys) -> None:
+        from signalhub.cli import build_parser
+
+        text = build_parser().format_help()
+        for verb in ("consume", "cursors"):
+            assert verb in text
+
+
+class TestConsumeCursors:
+    """CLI surface for the per-consumer cursor.
+
+    The point of these tests is the fan-out guarantee: two flows reading the
+    same bus must each see the same events, and one advancing must not affect
+    the other.
+    """
+
+    @staticmethod
+    def _seed(db: str, n: int = 4) -> None:
+        from signalhub.store import Store
+
+        store = Store(db)
+        try:
+            store.publish(
+                [
+                    (f"a/repo{i}", f"https://github.com/a/repo{i}", 0.5, {"stars": 100 + i})
+                    for i in range(n)
+                ],
+                run_id=1,
+            )
+        finally:
+            store.close()
+
+    def test_two_consumers_both_see_the_same_events(self, tmp_path, capsys) -> None:
+        db = str(tmp_path / "h.db")
+        self._seed(db)
+        assert main(["--db", db, "--json", "consume", "a", "--limit", "10"]) == 0
+        out_a = json.loads(capsys.readouterr().out)
+
+        assert main(["--db", db, "--json", "consume", "b", "--limit", "10"]) == 0
+        out_b = json.loads(capsys.readouterr().out)
+
+        assert [e["id"] for e in out_a["events"]] == [e["id"] for e in out_b["events"]]
+        assert len(out_a["events"]) == 4
+
+    def test_advance_moves_only_that_consumer(self, tmp_path, capsys) -> None:
+        db = str(tmp_path / "h.db")
+        self._seed(db)
+
+        assert main(["--db", db, "--json", "consume", "a", "--limit", "10", "--advance"]) == 0
+        assert json.loads(capsys.readouterr().out)["cursor"] > 0
+
+        assert main(["--db", db, "--json", "consume", "a", "--limit", "10"]) == 0
+        assert json.loads(capsys.readouterr().out)["events"] == []
+
+        assert main(["--db", db, "--json", "consume", "b", "--limit", "10"]) == 0
+        assert len(json.loads(capsys.readouterr().out)["events"]) == 4
+
+    def test_reading_without_advance_leaves_the_cursor_alone(self, tmp_path, capsys) -> None:
+        db = str(tmp_path / "h.db")
+        self._seed(db)
+        assert main(["--db", db, "--json", "consume", "a", "--limit", "10"]) == 0
+        assert json.loads(capsys.readouterr().out)["cursor"] == 0
+
+        assert main(["--db", db, "--json", "consume", "a", "--limit", "10"]) == 0
+        assert len(json.loads(capsys.readouterr().out)["events"]) == 4
+
+    def test_cursors_reports_each_consumer_lag(self, tmp_path, capsys) -> None:
+        db = str(tmp_path / "h.db")
+        self._seed(db)
+        main(["--db", db, "--json", "consume", "a", "--limit", "2", "--advance"])
+        capsys.readouterr()
+
+        assert main(["--db", db, "--json", "cursors"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        rows = {r["consumer"]: r for r in payload["consumers"]}
+        assert rows["a"]["last_id"] > 0
+        assert rows["a"]["pending"] == 2
+
+    def test_cursors_on_a_fresh_db_is_empty(self, tmp_path, capsys) -> None:
+        assert main(["--db", str(tmp_path / "h.db"), "--json", "cursors"]) == 0
+        assert json.loads(capsys.readouterr().out)["consumers"] == []

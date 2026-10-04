@@ -16,6 +16,118 @@ def upsert(store: Store, repos, scores=None) -> tuple[int, list[str]]:
     return store.upsert_repos((r, scores[r.full_name]) for r in repos)
 
 
+class TestConsumerCursors:
+    """Each consumer advances its own cursor; one never steals another's work.
+
+    The single ``consumed_by`` column cannot express this: whichever flow reads
+    first claims the events, and the second flow sees nothing. These tests pin
+    the independent-cursor behaviour that replaces it.
+    """
+
+    def _seed(self, store: Store, n: int = 3) -> list[int]:
+        ids: list[int] = []
+        for i in range(n):
+            store.publish(
+                [(f"a/repo{i}", f"https://github.com/a/repo{i}", 0.5, {"i": i})],
+                run_id=1,
+            )
+            ids.append(store.max_event_id())
+        return ids
+
+    def test_a_consumer_sees_only_events_its_cursor_has_not_passed(self, store: Store) -> None:
+        ids = self._seed(store)
+        first = store.read_events_for("morning-ai", limit=10)
+        assert [e["id"] for e in first] == ids
+
+        assert store.advance_cursor("morning-ai", ids) == 3
+        assert store.read_events_for("morning-ai", limit=10) == []
+
+    def test_two_consumers_each_see_every_event(self, store: Store) -> None:
+        ids = self._seed(store)
+        digest = store.read_events_for("daily-digest", limit=10)
+        news = store.read_events_for("morning-ai", limit=10)
+
+        assert [e["id"] for e in digest] == [e["id"] for e in news] == ids
+
+        store.advance_cursor("daily-digest", ids)
+        # The critical assertion: the digest reading first must not starve the
+        # other flow.
+        assert [e["id"] for e in store.read_events_for("morning-ai", limit=10)] == ids
+        assert store.read_events_for("daily-digest", limit=10) == []
+
+    def test_cursor_resumes_after_a_partial_batch(self, store: Store) -> None:
+        ids = self._seed(store, n=5)
+        batch = store.read_events_for("news", limit=2)
+        assert len(batch) == 2
+
+        store.advance_cursor("news", [e["id"] for e in batch])
+        rest = store.read_events_for("news", limit=10)
+        assert [e["id"] for e in rest] == ids[2:]
+
+        store.advance_cursor("news", [e["id"] for e in rest])
+        assert store.read_events_for("news", limit=10) == []
+
+    def test_a_failing_consumer_can_replay_by_rewinding(self, store: Store) -> None:
+        ids = self._seed(store, n=3)
+        store.advance_cursor("news", ids)
+        assert store.read_events_for("news", limit=10) == []
+
+        store.rewind_cursor("news", 0)
+        replayed = store.read_events_for("news", limit=10)
+        assert [e["id"] for e in replayed] == ids
+
+    def test_cursor_is_per_consumer_not_global(self, store: Store) -> None:
+        self._seed(store, n=2)
+        store.advance_cursor("a", [store.max_event_id()])
+
+        assert store.cursor_position("b") == 0
+        assert store.cursor_position("a") == store.max_event_id()
+
+    def test_advance_to_an_earlier_id_does_not_rewind_implicitly(self, store: Store) -> None:
+        self._seed(store, n=4)
+        store.advance_cursor("news", [store.max_event_id()])
+        high = store.cursor_position("news")
+
+        # A late ack from a straggler batch must not rewind the cursor.
+        store.advance_cursor("news", [1])
+        assert store.cursor_position("news") == high
+
+    def test_unknown_consumer_starts_at_the_beginning(self, store: Store) -> None:
+        self._seed(store, n=2)
+        assert store.cursor_position("never-seen") == 0
+        assert len(store.read_events_for("never-seen", limit=10)) == 2
+
+    def test_advance_with_no_ids_is_a_no_op(self, store: Store) -> None:
+        self._seed(store, n=2)
+        assert store.advance_cursor("news", []) == 0
+        assert store.cursor_position("news") == 0
+
+    def test_list_consumers_reports_activity(self, store: Store) -> None:
+        self._seed(store, n=2)
+        store.advance_cursor("news", [store.max_event_id()])
+        store.advance_cursor("quiet", [])
+
+        rows = {r["consumer"]: r for r in store.list_consumers()}
+        assert "news" in rows
+        assert rows["news"]["last_id"] == store.max_event_id()
+        # A consumer that never advanced is not worth reporting.
+        assert "quiet" not in rows
+
+    def test_reading_one_consumer_does_not_move_any_cursor(self, store: Store) -> None:
+        self._seed(store, n=3)
+        store.read_events_for("news", limit=10)
+        assert store.cursor_position("news") == 0
+
+    def test_run_filter_still_applies_for_a_consumer(self, store: Store) -> None:
+        self._seed(store, n=2)
+        store.publish(
+            [("a/later", "https://github.com/a/later", 0.5, {})],
+            run_id=2,
+        )
+        later = store.read_events_for("news", run_id=2)
+        assert [e["full_name"] for e in later] == ["a/later"]
+
+
 class TestRepos:
     def test_insert_then_update_reports_new_only_once(self, store: Store) -> None:
         total, new = upsert(store, [make_repo("a/one"), make_repo("a/two")])

@@ -179,6 +179,64 @@ def cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_consume(args: argparse.Namespace) -> int:
+    """Read events for one named consumer and advance only that consumer's cursor.
+
+    This is the fan-out interface. Each flow keeps its own cursor, so the digest
+    reading first never starves a second flow. The cursor only moves when the
+    caller asks for it, which makes a crashed consumer replay instead of losing
+    events.
+    """
+
+    hub = _hub(args)
+    consumer = args.consumer
+    events = hub.store.read_events_for(consumer, kind=args.kind, run_id=args.run, limit=args.limit)
+    ids = [e["id"] for e in events]
+    if args.advance and ids:
+        hub.store.advance_cursor(consumer, ids)
+
+    if args.json:
+        _out(
+            {
+                "consumer": consumer,
+                "cursor": hub.store.cursor_position(consumer),
+                "pending": len(ids),
+                "events": events,
+            },
+            args,
+        )
+        return 0
+
+    if not events:
+        pos = hub.store.cursor_position(consumer)
+        print(f"[{consumer}] sin eventos nuevos (cursor={pos})")
+        return 0
+    for e in events:
+        p = e["payload"]
+        print(f"#{e['id']:>5} {e['full_name']:45} score={e['score']:.3f} ⭐{p.get('stars', 0)}")
+    if args.advance:
+        print(f"[{consumer}] cursor avanzado a {hub.store.cursor_position(consumer)}")
+    else:
+        print(f"[{consumer}] {len(ids)} eventos (usa --advance para confirmar)")
+    return 0
+
+
+def cmd_cursors(args: argparse.Namespace) -> int:
+    """Show every consumer and how far behind it is."""
+
+    hub = _hub(args)
+    rows = hub.store.list_consumers()
+    if args.json:
+        _out({"head_event_id": hub.store.max_event_id(), "consumers": rows}, args)
+        return 0
+    if not rows:
+        print("(ningún consumidor ha avanzado su cursor)")
+        return 0
+    for r in rows:
+        print(f"{r['consumer']:24} cursor={r['last_id']:>6}  pendiente={r['pending']:>6}")
+    return 0
+
+
 def cmd_ack(args: argparse.Namespace) -> int:
     hub = _hub(args)
     n = hub.store.mark_delivered(args.repos, prefix=args.prefix)
@@ -345,6 +403,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--consume", nargs="?", const="cli", default=None, metavar="CONSUMER", help="marcar leídos"
     )
     e.set_defaults(func=cmd_events)
+
+    c = sub.add_parser(
+        "consume",
+        help="leer eventos de un consumidor y avanzar SU cursor (fan-out)",
+    )
+    c.add_argument("consumer", help="nombre del flujo, p.ej. morning-ai")
+    c.add_argument("--limit", type=int, default=50)
+    c.add_argument("--kind", default=None, help="filtrar por tipo de evento")
+    c.add_argument("--run", type=int, default=None, help="filtrar por corrida")
+    c.add_argument(
+        "--advance",
+        action="store_true",
+        help="avanzar el cursor (hazlo solo tras procesar de verdad)",
+    )
+    c.set_defaults(func=cmd_consume)
+
+    u = sub.add_parser("cursors", help="ver cada consumidor y su retraso")
+    u.set_defaults(func=cmd_cursors)
 
     a = sub.add_parser("ack", help="marcar repos como vistos")
     a.add_argument("repos", nargs="+")

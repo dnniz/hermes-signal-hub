@@ -10,6 +10,7 @@ costs.
 | [0002](0002-stdlib-only.md) | Standard library only, zero dependencies | accepted |
 | [0003](0003-velocity-over-stars.md) | Rank on velocity, not absolute stars | accepted |
 | [0004](0004-event-bus-for-interagent-routing.md) | An event bus in SQLite as the inter-agent interface | accepted |
+| [0005](0005-cursor-per-consumer.md) | A cursor per consumer, not a shared `consumed_by` | accepted |
 
 ## Why these four
 
@@ -24,6 +25,10 @@ up front:
   projects. Ranking had to change to answer the actual question.
 - **0004** — decided by the requirement that other agent flows consume the same
   discoveries independently.
+- **0005** — a correction to 0004. The bus could not actually fan out, because
+  the first consumer to read claimed the events. Found by asking what happens
+  when a *second* flow connects, which is the requirement 0004 was written to
+  satisfy.
 
 ## Operational decisions that are *not* here
 
